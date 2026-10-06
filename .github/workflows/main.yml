@@ -1,0 +1,344 @@
+# ===================================================================
+# RDP — Full Auto-Setup + S2C Flow Bot Ready on Desktop
+# Runs for full 6 hours (GitHub Actions max), then stops.
+# NO auto-restart. Manually re-run when needed.
+# ===================================================================
+# What this does:
+#   1. Enables RDP, creates RDPUser
+#   2. Pre-installs Python packages + Playwright + Chrome (ALL done by workflow)
+#   3. Extracts S2C Flow bot to C:\S2C_Flow + shortcut on RDPUser desktop
+#   4. Installs Tailscale for remote access
+#   5. Bot is NOT auto-started — YOU run START.bat from desktop after RDP login
+#   6. Session runs for 6 hours, then stops automatically
+# ===================================================================
+# REQUIRED GITHUB SECRETS:
+#   1. TAILSCALE_AUTH_KEY  → Tailscale Admin → Settings → Keys → Generate Auth Key
+#   2. RDP_PASSWORD        → Your RDP password (e.g. S2CFlow@2026!)
+# ===================================================================
+name: RDP — S2C Flow Ready
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-session:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # --- 1. Enable RDP + Dashboard Port ----------------------------------
+      - name: Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-S2C" 2>$null
+          netsh advfirewall firewall add rule name="RDP-S2C" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall delete rule name="S2C-Dashboard" 2>$null
+          netsh advfirewall firewall add rule name="S2C-Dashboard" dir=in action=allow protocol=TCP localport=5000
+          Restart-Service -Name TermService -Force
+          Write-Host "[OK] RDP + Dashboard port 5000 opened"
+
+      # --- 2. Create RDP User ---------------------------------------------
+      - name: Create RDP User
+        run: |
+          $password = "${{ secrets.RDP_PASSWORD }}"
+          if (-not $password) { $password = "S2CFlow@2026!" }
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+            Write-Host "[OK] User Created"
+          } else {
+            Set-LocalUser -Name "RDPUser" -Password $securePass
+            Write-Host "[OK] User Updated"
+          }
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      # --- 3. Setup Python 3.11 ------------------------------------------
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # --- 4. Verify Chrome (needed for headed browser mode) -------------
+      - name: Verify Chrome
+        run: |
+          $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (Test-Path $chromePath) {
+            $version = (Get-Item $chromePath).VersionInfo.ProductVersion
+            Write-Host "[OK] Google Chrome $version found"
+            try {
+              $regVer = (Get-ItemProperty -Path "HKLM:\Software\Google\Chrome\BLBeacon" -Name "version" -ErrorAction Stop).version
+              Write-Host "[OK] Registry BLBeacon: $regVer"
+            } catch {
+              try {
+                $regVer = (Get-ItemProperty -Path "HKCU:\Software\Google\Chrome\BLBeacon" -Name "version" -ErrorAction Stop).version
+                Write-Host "[OK] Registry BLBeacon: $regVer"
+              } catch {
+                Write-Host "[WARN] Registry BLBeacon not found - bot uses Chrome 150 fallback"
+              }
+            }
+          } else {
+            Write-Host "[WARN] Chrome not at default path - installing via winget..."
+            winget install Google.Chrome --silent --accept-package-agreements --accept-source-agreements 2>$null
+          }
+          python --version
+
+      # --- 5. Clone Repo & Extract S2C Flow Bot to Desktop ----------------
+      - name: Clone Repo and Extract Bot
+        run: |
+          $botDir  = "C:\S2C_Flow"
+          $repoDir = "C:\repo_clone"
+          $zipName = "S2CFLOW_lastupdate.zip"
+
+          Write-Host "[DOWNLOAD] Cloning repo..."
+          $repoUrl = "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git clone --depth 1 $repoUrl $repoDir
+          if ($LASTEXITCODE -ne 0) { Write-Error "[ERROR] Clone failed"; exit 1 }
+          Write-Host "[OK] Repo cloned"
+
+          $zipPath = "$repoDir\$zipName"
+          if (-not (Test-Path $zipPath)) {
+            Write-Error "[ERROR] $zipName not found in repo root!"
+            exit 1
+          }
+
+          Write-Host "[EXTRACT] Extracting to $botDir..."
+          if (Test-Path $botDir) { Remove-Item $botDir -Recurse -Force }
+          Expand-Archive -Path $zipPath -DestinationPath $botDir -Force
+
+          # Handle nested single subfolder
+          $subFolders = Get-ChildItem $botDir -Directory
+          if ($subFolders.Count -eq 1 -and (Get-ChildItem $botDir -File).Count -eq 0) {
+            $inner = $subFolders[0].FullName
+            Get-ChildItem $inner | Move-Item -Destination $botDir -Force
+            Remove-Item $inner -Force -ErrorAction SilentlyContinue
+          }
+
+          Remove-Item $repoDir -Recurse -Force
+          Write-Host "[OK] Bot extracted to $botDir"
+          Get-ChildItem $botDir | Select-Object Name | Format-Table -HideTableHeaders
+
+      # --- 6. Install System-Wide Python + Packages + Playwright + Fonts ----
+      # CRITICAL: actions/setup-python installs Python only for runneradmin.
+      # We also install Python system-wide so RDPUser can run the bot directly.
+      - name: Pre-install Packages + Playwright + Fonts
+        run: |
+          $botDir = "C:\S2C_Flow"
+          $sysPy  = "C:\Python311\python.exe"
+
+          # Install Python 3.11 system-wide (InstallAllUsers=1)
+          Write-Host "[SETUP] Installing Python 3.11 system-wide for RDPUser..."
+          $pyMsi = "$env:TEMP\python-3.11.9-amd64.exe"
+          Invoke-WebRequest "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe" -OutFile $pyMsi -UseBasicParsing
+          Start-Process $pyMsi -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 Include_launcher=1" -Wait
+          Remove-Item $pyMsi -Force
+          Write-Host "[OK] Python 3.11 installed system-wide"
+
+          # Verify system Python exists
+          if (-not (Test-Path $sysPy)) {
+            $sysPy = (Get-Command python -ErrorAction SilentlyContinue).Source
+            Write-Host "[WARN] Fallback python: $sysPy"
+          }
+
+          # Install packages using system Python
+          Write-Host "[SETUP] Installing Python packages (system-wide)..."
+          & $sysPy -m pip install --upgrade pip -q
+          & $sysPy -m pip install -r "$botDir\requirements.txt" -q
+          Write-Host "[OK] Python packages installed"
+
+          # Install Playwright Chromium using system Python
+          Write-Host "[SETUP] Installing Playwright Chromium..."
+          & $sysPy -m playwright install chromium
+          & $sysPy -m playwright install-deps chromium 2>$null
+          Write-Host "[OK] Playwright Chromium installed"
+
+          # Download Android fonts (for fingerprint authenticity)
+          Write-Host "[SETUP] Downloading fonts..."
+          $fontDir = "$botDir\fonts"
+          New-Item -ItemType Directory -Path $fontDir -Force | Out-Null
+          $fonts = @(
+            @("https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-400-normal.ttf", "Roboto-Regular.ttf"),
+            @("https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-700-normal.ttf", "Roboto-Bold.ttf"),
+            @("https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-500-normal.ttf", "Roboto-Medium.ttf"),
+            @("https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-300-normal.ttf", "Roboto-Light.ttf"),
+            @("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans@latest/latin-400-normal.ttf", "NotoSans-Regular.ttf"),
+            @("https://cdn.jsdelivr.net/fontsource/fonts/noto-sans@latest/latin-700-normal.ttf", "NotoSans-Bold.ttf")
+          )
+          foreach ($f in $fonts) {
+            $dest = "$fontDir\$($f[1])"
+            if (-not (Test-Path $dest)) {
+              try {
+                Invoke-WebRequest -Uri $f[0] -OutFile $dest -UseBasicParsing
+                Write-Host "  [OK] $($f[1])"
+              } catch {
+                Write-Host "  [WARN] Failed: $($f[1])"
+              }
+            } else {
+              Write-Host "  [OK] $($f[1]) (exists)"
+            }
+          }
+
+          # Install fonts system-wide (copy to Windows Fonts folder)
+          $winFonts = "C:\Windows\Fonts"
+          foreach ($f in $fonts) {
+            $src = "$fontDir\$($f[1])"
+            if (Test-Path $src) {
+              Copy-Item $src "$winFonts\$($f[1])" -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Write-Host "[OK] Fonts installed system-wide"
+
+          # Mark setup as done so START.bat skips installation
+          $doneFile = "$botDir\.setup_done"
+          Set-Content -Path $doneFile -Value "setup complete" -ErrorAction SilentlyContinue
+          Write-Host "[OK] Setup marked complete — START.bat will skip install"
+
+      # --- 7. Create Desktop Shortcut for RDPUser -----------------------
+      - name: Create Desktop Shortcut
+        run: |
+          # Dynamically find RDPUser desktop — username may have suffix like RDPUser.runnervmr7g38
+          $rdpUser = Get-LocalUser -Name "RDPUser" -ErrorAction SilentlyContinue
+          $rdpProfile = "C:\Users\RDPUser"
+          # Check if a profile folder with RDPUser prefix exists
+          $profiles = Get-ChildItem "C:\Users" -Directory | Where-Object { $_.Name -like "RDPUser*" } | Select-Object -First 1
+          if ($profiles) {
+            $rdpProfile = $profiles.FullName
+            Write-Host "[OK] Found RDPUser profile: $rdpProfile"
+          }
+          $rdpDesktop = "$rdpProfile\Desktop"
+          if (-not (Test-Path $rdpDesktop)) {
+            New-Item -ItemType Directory -Path $rdpDesktop -Force | Out-Null
+          }
+
+          # Create START.bat on desktop (wrapper that calls the real one)
+          $batPath = "$rdpDesktop\START_S2C_Flow.bat"
+          $batLines = @(
+            "@echo off",
+            "title S2C Flow Bot - Starting...",
+            "color 0B",
+            "echo.",
+            "echo  ========================================",
+            "echo    S2C FLOW BOT - Starting...",
+            "echo    Dashboard: http://localhost:5000",
+            "echo  ========================================",
+            "echo.",
+            "cd /d C:\S2C_Flow",
+            ":: Check if flask is installed, install if missing",
+            "python -c ""import flask"" 2>nul || (",
+            "  echo [SETUP] Installing missing packages...",
+            "  pip install -r requirements.txt -q",
+            "  python -m playwright install chromium",
+            ")",
+            "python app.py",
+            "pause"
+          )
+          Set-Content -Path $batPath -Value $batLines -Encoding ASCII
+          Write-Host "[OK] START_S2C_Flow.bat created on RDPUser desktop"
+
+          # Also create a Dashboard shortcut to open browser
+          $wsShell = New-Object -ComObject WScript.Shell
+          $shortcut = $wsShell.CreateShortcut("$rdpDesktop\S2C Dashboard.lnk")
+          $shortcut.TargetPath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          $shortcut.Arguments = "http://localhost:5000"
+          $shortcut.IconLocation = "C:\Program Files\Google\Chrome\Application\chrome.exe,0"
+          $shortcut.Save()
+          Write-Host "[OK] Dashboard shortcut created"
+
+          # Grant RDPUser full access to bot directory
+          icacls "C:\S2C_Flow" /grant "RDPUser:(OI)(CI)F" /T /Q 2>$null
+          # Also grant to full profile path if different name
+          if ($rdpProfile -notlike "*\RDPUser") {
+            $rdpUserName = Split-Path $rdpProfile -Leaf
+            icacls "C:\S2C_Flow" /grant "${rdpUserName}:(OI)(CI)F" /T /Q 2>$null
+          }
+          Write-Host "[OK] Permissions granted to RDPUser"
+
+          # Show what's on the desktop
+          Write-Host "`n=== RDPUser Desktop ==="
+          Get-ChildItem $rdpDesktop | Select-Object Name | Format-Table -HideTableHeaders
+
+      # --- 8. Install Tailscale ------------------------------------------
+      - name: Install Tailscale
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" `
+            -OutFile "$env:TEMP\tailscale.msi" -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$env:TEMP\tailscale.msi`"","/quiet","/norestart" -Wait
+          Remove-Item "$env:TEMP\tailscale.msi" -Force
+          Write-Host "[OK] Tailscale Installed"
+
+      # --- 9. Connect Tailscale ------------------------------------------
+      - name: Connect Tailscale
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tsExe up `
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+            --hostname="s2c-rdp" `
+            --accept-routes
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+            Start-Sleep -Seconds 3
+            $tsIP = & $tsExe ip -4 2>$null
+            $retries++
+          }
+          if (-not $tsIP) { Write-Error "[ERROR] Tailscale IP not found"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "[OK] Tailscale Connected: $tsIP"
+
+      # --- 10. Verify RDP ------------------------------------------------
+      - name: Verify RDP
+        run: |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) { Write-Error "[ERROR] RDP port 3389 unreachable"; exit 1 }
+          Write-Host "[OK] RDP Ready on port 3389"
+
+      # --- 11. Connection Info -------------------------------------------
+      - name: Connection Info
+        run: |
+          Write-Host ""
+          Write-Host "+===============================================+"
+          Write-Host "|     S2C FLOW RDP — READY TO USE              |"
+          Write-Host "+===============================================+"
+          Write-Host "|  Tailscale IP  : $env:TAILSCALE_IP"
+          Write-Host "|  Username      : RDPUser"
+          Write-Host "|  Password      : $env:RDP_PASS"
+          Write-Host "|  RDP Port      : 3389"
+          Write-Host "|  Session       : 6 hours (no auto-restart)    |"
+          Write-Host "+===============================================+"
+          Write-Host "|  STEPS AFTER RDP LOGIN:                       |"
+          Write-Host "|  1. Double-click START_S2C_Flow.bat on desktop|"
+          Write-Host "|  2. Wait for Flask dashboard to start         |"
+          Write-Host "|  3. Open Chrome to localhost:5000              |"
+          Write-Host "|  4. Paste proxies + smartlinks -> Start!      |"
+          Write-Host "|  5. Bot opens real Chrome windows visually    |"
+          Write-Host "+===============================================+"
+          Write-Host "|  All packages PRE-INSTALLED. No waiting!     |"
+          Write-Host "|  Bot is on Desktop, NOT auto-started.        |"
+          Write-Host "|  Session ends after 6 hours automatically.  |"
+          Write-Host "+===============================================+"
+
+      # --- 12. Keep Alive (6 hours, no auto-restart) ---------------------
+      - name: Keep Alive — 6 Hour Timer
+        shell: powershell
+        run: |
+          $waitSeconds   = 21600  # 6 hours = 360 min (GitHub max)
+          $checkInterval = 600    # 10 min
+
+          Write-Host "[TIMER] Session running for 6 hours. No auto-restart."
+          Write-Host "[INFO] Bot is ready on Desktop. Login via RDP and run START_S2C_Flow.bat"
+
+          $elapsed = 0
+          while ($elapsed -lt $waitSeconds) {
+            Start-Sleep -Seconds $checkInterval
+            $elapsed += $checkInterval
+            $remaining = $waitSeconds - $elapsed
+            $hrs  = [math]::Floor($remaining / 3600)
+            $mins = [math]::Floor(($remaining % 3600) / 60)
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session alive | ${hrs}h ${mins}m left"
+          }
+
+          Write-Host "[DONE] 6 hours complete. Session ending."
+          Write-Host "[INFO] To restart: go to Actions tab -> Run workflow again."
