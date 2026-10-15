@@ -275,3 +275,28 @@ jobs:
           Write-Host "|  Session ends after 6 hours automatically.  |"
           Write-Host "|  Collected links: Desktop -> output folder   |"
           Write-Host "+===============================================+"
+
+      # --- 12. Keep Alive (6 hours, no auto-restart) ---------------------
+      # CRITICAL: ei step NAA hole workflow shuru holei session bondho
+      # hoye jay — RDP connect korar AGEI VM destroy. 6 hours jinda rakhe.
+      - name: Keep Alive — 6 Hour Timer
+        shell: powershell
+        run: |
+          $waitSeconds   = 21600  # 6 hours = 360 min (GitHub max)
+          $checkInterval = 600    # 10 min
+
+          Write-Host "[TIMER] Session running for 6 hours. No auto-restart."
+          Write-Host "[INFO] Bot is ready on Desktop. Login via RDP and run START_FB_Loader.bat"
+
+          $elapsed = 0
+          while ($elapsed -lt $waitSeconds) {
+            Start-Sleep -Seconds $checkInterval
+            $elapsed += $checkInterval
+            $remaining = $waitSeconds - $elapsed
+            $hrs  = [math]::Floor($remaining / 3600)
+            $mins = [math]::Floor(($remaining % 3600) / 60)
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session alive | ${hrs}h ${mins}m left"
+          }
+
+          Write-Host "[DONE] 6 hours complete. Session ending."
+          Write-Host "[INFO] To restart: go to Actions tab -> Run workflow again."
